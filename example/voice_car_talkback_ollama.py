@@ -53,6 +53,7 @@ llm.set_welcome(WELCOME)
 
 WAKE_WORDS = ["hey wally"]
 
+# State
 mode = MODE_DRIVE
 drive_enabled = False
 
@@ -63,10 +64,8 @@ STEER_RIGHT = 25
 STEER_CENTER = 0
 
 PULSE_TIME = 1.0
-drive_style = "pulse"  # pulse / continuous
-continuous_motion = "STOP"  # STOP / FWD / BACK
-
-# Circle
+drive_style = "pulse"       # "pulse" or "continuous"
+continuous_motion = "STOP"  # "STOP" / "FWD" / "BACK"
 circle_active = False
 CIRCLE_STEER = 25
 
@@ -75,11 +74,23 @@ SERVO_CENTER = 0
 SERVO_LOOK_LEFT = -20
 SERVO_LOOK_RIGHT = 20
 
-# Streaming speech chunking
+# Camera pan/tilt angles (keep state so we can do fun motions)
+cam_pan = 0
+cam_tilt = 0
+CAM_MIN = -35
+CAM_MAX = 35
+
+# Speech chunking
 SAY_CHUNK_MIN_CHARS = 70
 SAY_CHUNK_MAX_CHARS = 160
 SAY_END_PUNCT = {".", "!", "?", "\n"}
 
+# Safe mode trigger aliases
+SAFE_MODE_TRIGGERS = ("safe mode", "save mode", "save more", "object avoidance")
+
+# AI/Drive mishears
+AI_MODE_TRIGGERS = ("ai mode", "a mod", "a more", "a mode")
+DRIVE_MODE_TRIGGERS = ("drive mode", "dr more", "dr mode", "drive")
 
 # ----------------------------
 # Helpers
@@ -163,7 +174,7 @@ def speak_streaming_response(token_stream):
 def ask_llm_and_speak(question: str):
     print("LLM question:", question)
     try:
-        signal_thinking()
+        camera_nod(3)
         response = llm.prompt(question, stream=True)
     except Exception as e:
         say(f"Sorry, I couldn't reach the local model. {e}")
@@ -192,17 +203,158 @@ def sanitize_distance(raw):
         return None
     return round(d, 2)
 
+# ----------------------------
+# Camera control (pan/tilt)
+# Uses px.set_cam_pan_angle() and px.set_cam_tilt_angle() per docs. :contentReference[oaicite:1]{index=1}
+# ----------------------------
+def camera_supported() -> bool:
+    return hasattr(px, "set_cam_pan_angle") and hasattr(px, "set_cam_tilt_angle")
+
+def set_cam_pan(angle: int):
+    global cam_pan
+    cam_pan = int(clamp(angle, CAM_MIN, CAM_MAX))
+    if not camera_supported():
+        raise RuntimeError("Camera pan/tilt servos not available.")
+    px.set_cam_pan_angle(cam_pan)
+
+def set_cam_tilt(angle: int):
+    global cam_tilt
+    cam_tilt = int(clamp(angle, CAM_MIN, CAM_MAX))
+    if not camera_supported():
+        raise RuntimeError("Camera pan/tilt servos not available.")
+    px.set_cam_tilt_angle(cam_tilt)
+
+def camera_center():
+    set_cam_pan(0)
+    set_cam_tilt(0)
+
+def camera_nod(times=2):
+    """Nod = tilt up/down a few times."""
+    start = cam_tilt
+    for _ in range(times):
+        set_cam_tilt(clamp(start - 18, CAM_MIN, CAM_MAX))
+        time.sleep(0.18)
+        set_cam_tilt(clamp(start + 10, CAM_MIN, CAM_MAX))
+        time.sleep(0.18)
+    set_cam_tilt(start)
+
+def camera_shake(times=2):
+    """Shake head = pan left/right."""
+    start = cam_pan
+    for _ in range(times):
+        set_cam_pan(clamp(start - 20, CAM_MIN, CAM_MAX))
+        time.sleep(0.18)
+        set_cam_pan(clamp(start + 20, CAM_MIN, CAM_MAX))
+        time.sleep(0.18)
+    set_cam_pan(start)
+
+def camera_scan():
+    """Scan slowly left to right."""
+    start_tilt = cam_tilt
+    set_cam_tilt(start_tilt)  # hold tilt
+    for a in [-30, -15, 0, 15, 30, 0]:
+        set_cam_pan(a)
+        time.sleep(0.25)
+
+# ----------------------------
+# DRIVE helpers
+# ----------------------------
+def drive_forward_pulse():
+    px.set_dir_servo_angle(STEER_CENTER)
+    px.forward(speed)
+    time.sleep(PULSE_TIME)
+    px.stop()
+
+def drive_backward_pulse():
+    px.set_dir_servo_angle(STEER_CENTER)
+    px.backward(speed)
+    time.sleep(PULSE_TIME)
+    px.stop()
+
+def drive_left_pulse():
+    px.set_dir_servo_angle(STEER_LEFT)
+    px.forward(speed)
+    time.sleep(PULSE_TIME)
+    px.stop()
+    px.set_dir_servo_angle(STEER_CENTER)
+
+def drive_right_pulse():
+    px.set_dir_servo_angle(STEER_RIGHT)
+    px.forward(speed)
+    time.sleep(PULSE_TIME)
+    px.stop()
+    px.set_dir_servo_angle(STEER_CENTER)
+
+def start_circle():
+    global circle_active, continuous_motion, drive_style
+    circle_active = True
+    drive_style = "continuous"
+    continuous_motion = "FWD"
+    px.set_dir_servo_angle(CIRCLE_STEER)
+    px.forward(speed)
+
+def refresh_continuous():
+    if not drive_enabled:
+        return
+    if circle_active:
+        px.set_dir_servo_angle(CIRCLE_STEER)
+        px.forward(speed)
+        return
+    if continuous_motion == "FWD":
+        px.set_dir_servo_angle(STEER_CENTER)
+        px.forward(speed)
+    elif continuous_motion == "BACK":
+        px.set_dir_servo_angle(STEER_CENTER)
+        px.backward(speed)
+
+# ----------------------------
+# Fun drive-mode actions
+# ----------------------------
+def fun_dance():
+    """A quick wiggle dance (steering + small motor bursts)."""
+    px.stop()
+    for ang in [-25, 25, -25, 25, 0]:
+        px.set_dir_servo_angle(ang)
+        px.forward(25)
+        time.sleep(0.20)
+        px.stop()
+        time.sleep(0.08)
+    px.set_dir_servo_angle(0)
+
+def fun_spin_short():
+    """Not a true spin (no differential), but a tight circle burst."""
+    px.set_dir_servo_angle(35)
+    px.forward(35)
+    time.sleep(1.0)
+    px.stop()
+    px.set_dir_servo_angle(0)
+
+def fun_lookaround():
+    """Camera scan + head shake if camera exists; otherwise steering wiggle."""
+    if camera_supported():
+        camera_scan()
+        camera_nod(1)
+        camera_shake(1)
+        camera_center()
+    else:
+        for ang in [-20, 20, 0]:
+            px.set_dir_servo_angle(ang)
+            time.sleep(0.2)
 
 # ----------------------------
 # SAFE MODE (strong escape attempts)
 # ----------------------------
 def run_safe_mode():
+    """
+    Autonomous obstacle avoidance loop.
+    Tries hard to escape by backing up and alternating turns.
+    """
     POWER = 45
     SafeDistance = 40.0
     DangerDistance = 20.0
 
-    MAX_BLOCKED_ATTEMPTS = 14
-    MAX_INVALID_READS = 20
+    MAX_BLOCKED_ATTEMPTS = 16
+    MAX_INVALID_READS = 30
     BACK_TIME = 0.70
     FORWARD_RECOVER_TIME = 0.35
     TURN_TIME = 0.18
@@ -280,58 +432,16 @@ def run_safe_mode():
         px.set_dir_servo_angle(0)
         print("SAFE MODE ENDED")
 
-
 # ----------------------------
-# DRIVE helpers
+# Help text (Drive mode)
 # ----------------------------
-def drive_forward_pulse():
-    px.set_dir_servo_angle(STEER_CENTER)
-    px.forward(speed)
-    time.sleep(PULSE_TIME)
-    px.stop()
-
-def drive_backward_pulse():
-    px.set_dir_servo_angle(STEER_CENTER)
-    px.backward(speed)
-    time.sleep(PULSE_TIME)
-    px.stop()
-
-def drive_left_pulse():
-    px.set_dir_servo_angle(STEER_LEFT)
-    px.forward(speed)
-    time.sleep(PULSE_TIME)
-    px.stop()
-    px.set_dir_servo_angle(STEER_CENTER)
-
-def drive_right_pulse():
-    px.set_dir_servo_angle(STEER_RIGHT)
-    px.forward(speed)
-    time.sleep(PULSE_TIME)
-    px.stop()
-    px.set_dir_servo_angle(STEER_CENTER)
-
-def start_circle():
-    global circle_active, continuous_motion, drive_style
-    circle_active = True
-    drive_style = "continuous"
-    continuous_motion = "FWD"
-    px.set_dir_servo_angle(CIRCLE_STEER)
-    px.forward(speed)
-
-def refresh_continuous():
-    if not drive_enabled:
-        return
-    if circle_active:
-        px.set_dir_servo_angle(CIRCLE_STEER)
-        px.forward(speed)
-        return
-    if continuous_motion == "FWD":
-        px.set_dir_servo_angle(STEER_CENTER)
-        px.forward(speed)
-    elif continuous_motion == "BACK":
-        px.set_dir_servo_angle(STEER_CENTER)
-        px.backward(speed)
-
+def help_drive():
+    return (
+        "Drive commands: start, stop, forward, backward, left, right, straight, circle. "
+        "Speed commands: faster, slower, speed 40. "
+        "Modes: pulse mode, continuous mode. "
+        "Fun: dance, spin, look around, nod, shake head, camera center, camera left, camera right, camera up, camera down."
+    )
 
 # ----------------------------
 # Main
@@ -352,7 +462,7 @@ try:
                 refresh_continuous()
 
             if mode == MODE_AI:
-                signal_listening()
+                camera_nod(3)
 
             res = stt.listen(stream=False)
             text = res.get("text", "") if isinstance(res, dict) else str(res)
@@ -362,7 +472,7 @@ try:
 
             print("Heard:", text)
 
-            # --- wake loop control ---
+            # --- session control ---
             if "sleep" in text:
                 stop_car(center=True)
                 drive_enabled = False
@@ -370,22 +480,26 @@ try:
                 say("Sleeping.")
                 break
 
-            # --- mode switches (accept common mishears) ---
-            if "ai mode" in text or "a mod" in text or "a more" in text:
+            if "help" in text:
+                say(help_drive())
+                continue
+
+            # --- mode switches (accept mishears) ---
+            if any(k in text for k in AI_MODE_TRIGGERS):
                 mode = MODE_AI
                 drive_enabled = False
                 stop_car(center=True)
                 say("AI mode. Ask me a question.")
                 continue
 
-            if "drive mode" in text or "dr more" in text or "drive" == text:
+            if any(k in text for k in DRIVE_MODE_TRIGGERS):
                 mode = MODE_DRIVE
                 drive_enabled = False
                 stop_car(center=True)
                 say("Drive mode.")
                 continue
 
-            if "safe mode" in text or "save mode" in text or "save more" in text or "object avoidance" in text:
+            if any(k in text for k in SAFE_MODE_TRIGGERS):
                 stop_car(center=True)
                 drive_enabled = False
                 mode = MODE_DRIVE
@@ -415,7 +529,7 @@ try:
                 ask_llm_and_speak(text)
                 continue
 
-            # --- DRIVE mode commands ---
+            # --- Drive mode only below ---
             if is_question(text):
                 say("Say AI mode if you want me to answer questions.")
                 continue
@@ -454,6 +568,79 @@ try:
             if "continuous mode" in text:
                 drive_style = "continuous"
                 say("Continuous mode.")
+                continue
+
+            # fun commands
+            if "dance" in text:
+                say("Dancing.")
+                fun_dance()
+                continue
+
+            if "spin" in text:
+                say("Spinning.")
+                fun_spin_short()
+                continue
+
+            if "look around" in text or "lookaround" in text:
+                say("Looking around.")
+                fun_lookaround()
+                continue
+
+            # camera fun
+            if "nod" in text:
+                if camera_supported():
+                    say("Nodding.")
+                    camera_nod(2)
+                else:
+                    say("Camera servos are not connected.")
+                continue
+
+            if "shake" in text or "shake head" in text:
+                if camera_supported():
+                    say("Shaking head.")
+                    camera_shake(2)
+                else:
+                    say("Camera servos are not connected.")
+                continue
+
+            if "camera center" in text or "center camera" in text:
+                if camera_supported():
+                    camera_center()
+                    say("Camera centered.")
+                else:
+                    say("Camera servos are not connected.")
+                continue
+
+            if "camera left" in text:
+                if camera_supported():
+                    set_cam_tilt(cam_tilt + 15)
+                    say("Camera left.")
+                else:
+                    say("Camera servos are not connected.")
+                continue
+
+            if "camera right" in text:
+                if camera_supported():
+                    set_cam_tilt(cam_tilt - 15)
+                    say("Camera right.")
+                else:
+                    say("Camera servos are not connected.")
+                continue
+
+            if "camera up" in text:
+                if camera_supported():
+                    set_cam_pan(cam_pan + 15)
+                    say("Camera up.")
+                else:
+                    say("Camera servos are not connected.")
+                continue
+
+            if "camera down" in text:
+                if camera_supported():
+                    set_cam_pan(cam_pan - 15)
+                    say("Camera down.")
+                else:
+                    say("Camera servos are not connected.")
                 continue
 
             # motion
