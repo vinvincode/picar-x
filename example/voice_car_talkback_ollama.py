@@ -3,11 +3,22 @@
 import os
 import time
 import re
+import threading
 
 from picarx import Picarx
 from picarx.stt import Vosk
 from picarx.tts import Piper
 from picarx.llm import Ollama
+from picarx.music import Music
+from gpiozero import Button, LED
+
+# Optional computer vision
+try:
+    from vilib import Vilib
+    VILIB_AVAILABLE = True
+except Exception:
+    VILIB_AVAILABLE = False
+
 
 # systemd services often have no login session; picarx uses os.getlogin()
 # which can crash with OSError -25. Force a stable username.
@@ -34,6 +45,34 @@ stt = Vosk(language="en-us")
 tts = Piper()
 tts.set_model("en_US-ryan-low")
 
+music = Music()
+
+usr_button = Button(25, pull_up=True)   # USR button
+rst_button = Button(16, pull_up=True)   # RST button
+hat_led = LED(26)                       # LED
+
+# ---- Autopilot stop event (instant stop even during sleeps) ----
+autopilot_stop_event = threading.Event()
+
+def _stop_autopilot_callback():
+    autopilot_stop_event.set()
+
+usr_button.when_pressed = _stop_autopilot_callback
+rst_button.when_pressed = _stop_autopilot_callback
+
+def sleep_interruptible(seconds: float) -> bool:
+    """
+    Sleep in small chunks so autopilot can exit quickly when button is pressed.
+    Returns False if interrupted by stop event, else True.
+    """
+    end = time.time() + seconds
+    while time.time() < end:
+        if autopilot_stop_event.is_set():
+            return False
+        time.sleep(0.05)
+    return True
+
+
 INSTRUCTIONS = (
     "You are a helpful assistant. "
     "Output must be plain text only. "
@@ -43,7 +82,7 @@ INSTRUCTIONS = (
 
 WELCOME = (
     "Hello. Say hey wally. Say start for drive mode, ai mode for questions, "
-    "or safe mode for autonomous driving and obstacle avoidance."
+    "or autopilot for autonomous driving and obstacle avoidance."
 )
 
 llm = Ollama(ip="localhost", model="llama3.2:3b")
@@ -69,6 +108,10 @@ continuous_motion = "STOP"  # "STOP" / "FWD" / "BACK"
 circle_active = False
 CIRCLE_STEER = 25
 
+# Turbo mode
+turbo_on = False
+TURBO_BOOST = 15  # extra speed when turbo is on (clamped)
+
 # Servo feedback
 SERVO_CENTER = 0
 SERVO_LOOK_LEFT = -20
@@ -85,8 +128,8 @@ SAY_CHUNK_MIN_CHARS = 70
 SAY_CHUNK_MAX_CHARS = 160
 SAY_END_PUNCT = {".", "!", "?", "\n"}
 
-# Safe mode trigger aliases
-SAFE_MODE_TRIGGERS = ("safe mode", "save mode", "save more", "object avoidance")
+# Autopilot trigger aliases
+AUTOPILOT_TRIGGERS = ("autopilot", "auto pilot", "autopilot mode", "auto", "on a pilot")
 
 # AI/Drive mishears
 AI_MODE_TRIGGERS = ("ai mode", "a mod", "a more", "a mode")
@@ -95,6 +138,26 @@ DRIVE_MODE_TRIGGERS = ("drive mode", "dr more", "dr mode", "drive")
 # ----------------------------
 # Helpers
 # ----------------------------
+def led_off():
+    try:
+        hat_led.off()
+    except Exception:
+        pass
+
+def led_listening():
+    # slow blink while waiting for speech
+    try:
+        hat_led.blink(on_time=0.25, off_time=0.25, background=True)
+    except Exception:
+        pass
+
+def led_thinking():
+    # fast blink while generating
+    try:
+        hat_led.blink(on_time=0.08, off_time=0.08, background=True)
+    except Exception:
+        pass
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -174,12 +237,16 @@ def speak_streaming_response(token_stream):
 def ask_llm_and_speak(question: str):
     print("LLM question:", question)
     try:
+        led_thinking()
         camera_nod(3)
         response = llm.prompt(question, stream=True)
     except Exception as e:
+        led_off()
         say(f"Sorry, I couldn't reach the local model. {e}")
         return
+
     speak_streaming_response(response)
+    led_off()
 
 def is_question(text: str) -> bool:
     t = text.strip().lower()
@@ -203,9 +270,13 @@ def sanitize_distance(raw):
         return None
     return round(d, 2)
 
+def current_drive_speed():
+    boost = TURBO_BOOST if turbo_on else 0
+    return int(clamp(speed + boost, 10, 60))
+
+
 # ----------------------------
 # Camera control (pan/tilt)
-# Uses px.set_cam_pan_angle() and px.set_cam_tilt_angle() per docs. :contentReference[oaicite:1]{index=1}
 # ----------------------------
 def camera_supported() -> bool:
     return hasattr(px, "set_cam_pan_angle") and hasattr(px, "set_cam_tilt_angle")
@@ -229,8 +300,9 @@ def camera_center():
     set_cam_tilt(0)
 
 def camera_nod(times=2):
-    """Nod = tilt up/down a few times."""
     start = cam_tilt
+    if not camera_supported():
+        return
     for _ in range(times):
         set_cam_tilt(clamp(start - 18, CAM_MIN, CAM_MAX))
         time.sleep(0.18)
@@ -239,8 +311,9 @@ def camera_nod(times=2):
     set_cam_tilt(start)
 
 def camera_shake(times=2):
-    """Shake head = pan left/right."""
     start = cam_pan
+    if not camera_supported():
+        return
     for _ in range(times):
         set_cam_pan(clamp(start - 20, CAM_MIN, CAM_MAX))
         time.sleep(0.18)
@@ -249,9 +322,10 @@ def camera_shake(times=2):
     set_cam_pan(start)
 
 def camera_scan():
-    """Scan slowly left to right."""
+    if not camera_supported():
+        return
     start_tilt = cam_tilt
-    set_cam_tilt(start_tilt)  # hold tilt
+    set_cam_tilt(start_tilt)
     for a in [-30, -15, 0, 15, 30, 0]:
         set_cam_pan(a)
         time.sleep(0.25)
@@ -261,26 +335,26 @@ def camera_scan():
 # ----------------------------
 def drive_forward_pulse():
     px.set_dir_servo_angle(STEER_CENTER)
-    px.forward(speed)
+    px.forward(current_drive_speed())
     time.sleep(PULSE_TIME)
     px.stop()
 
 def drive_backward_pulse():
     px.set_dir_servo_angle(STEER_CENTER)
-    px.backward(speed)
+    px.backward(current_drive_speed())
     time.sleep(PULSE_TIME)
     px.stop()
 
 def drive_left_pulse():
     px.set_dir_servo_angle(STEER_LEFT)
-    px.forward(speed)
+    px.forward(current_drive_speed())
     time.sleep(PULSE_TIME)
     px.stop()
     px.set_dir_servo_angle(STEER_CENTER)
 
 def drive_right_pulse():
     px.set_dir_servo_angle(STEER_RIGHT)
-    px.forward(speed)
+    px.forward(current_drive_speed())
     time.sleep(PULSE_TIME)
     px.stop()
     px.set_dir_servo_angle(STEER_CENTER)
@@ -291,27 +365,26 @@ def start_circle():
     drive_style = "continuous"
     continuous_motion = "FWD"
     px.set_dir_servo_angle(CIRCLE_STEER)
-    px.forward(speed)
+    px.forward(current_drive_speed())
 
 def refresh_continuous():
     if not drive_enabled:
         return
     if circle_active:
         px.set_dir_servo_angle(CIRCLE_STEER)
-        px.forward(speed)
+        px.forward(current_drive_speed())
         return
     if continuous_motion == "FWD":
         px.set_dir_servo_angle(STEER_CENTER)
-        px.forward(speed)
+        px.forward(current_drive_speed())
     elif continuous_motion == "BACK":
         px.set_dir_servo_angle(STEER_CENTER)
-        px.backward(speed)
+        px.backward(current_drive_speed())
 
 # ----------------------------
 # Fun drive-mode actions
 # ----------------------------
 def fun_dance():
-    """A quick wiggle dance (steering + small motor bursts)."""
     px.stop()
     for ang in [-25, 25, -25, 25, 0]:
         px.set_dir_servo_angle(ang)
@@ -321,16 +394,7 @@ def fun_dance():
         time.sleep(0.08)
     px.set_dir_servo_angle(0)
 
-def fun_spin_short():
-    """Not a true spin (no differential), but a tight circle burst."""
-    px.set_dir_servo_angle(35)
-    px.forward(35)
-    time.sleep(1.0)
-    px.stop()
-    px.set_dir_servo_angle(0)
-
 def fun_lookaround():
-    """Camera scan + head shake if camera exists; otherwise steering wiggle."""
     if camera_supported():
         camera_scan()
         camera_nod(1)
@@ -341,19 +405,43 @@ def fun_lookaround():
             px.set_dir_servo_angle(ang)
             time.sleep(0.2)
 
+def do_drift():
+    base = current_drive_speed()
+    px.forward(base)
+    for ang in [25, -25, 30, -30, 20, -20, 0]:
+        px.set_dir_servo_angle(ang)
+        time.sleep(0.16)
+    px.set_dir_servo_angle(0)
+    px.stop()
+
+def do_scan():
+    for ang in [-30, -15, 0, 15, 30, 0]:
+        px.set_dir_servo_angle(ang)
+        time.sleep(0.2)
+    px.forward(25)
+    time.sleep(0.5)
+    px.stop()
+    px.set_dir_servo_angle(0)
+    say("Scan complete.")
+
+def do_turbo_toggle():
+    global turbo_on
+    turbo_on = not turbo_on
+    say("Turbo on." if turbo_on else "Turbo off.")
+
+
 # ----------------------------
-# SAFE MODE (strong escape attempts)
+# Autopilot (button exits instantly)
 # ----------------------------
-def run_safe_mode():
+def run_autopilot():
     """
-    Autonomous obstacle avoidance loop.
-    Tries hard to escape by backing up and alternating turns.
+    Autopilot obstacle avoidance.
+    USR/RST buttons stop it instantly (even during long sleeps).
     """
     POWER = 45
     SafeDistance = 40.0
     DangerDistance = 20.0
 
-    MAX_BLOCKED_ATTEMPTS = 16
     MAX_INVALID_READS = 30
     BACK_TIME = 0.70
     FORWARD_RECOVER_TIME = 0.35
@@ -362,24 +450,68 @@ def run_safe_mode():
     ESCAPE_LEFT_ANGLE = 35
     ESCAPE_RIGHT_ANGLE = -35
 
-    say("Safe mode. Autonomous driving and obstacle avoidance.")
-    print("SAFE MODE STARTED")
+    # Exit-by-hand-cover
+    COVER_EXIT_DIST = 6.0
+    COVER_EXIT_TIME = 1.2
+    cover_start = None
 
-    blocked_attempts = 0
+    # Voice throttle
+    SAY_EVERY_S = 1.0
+    last_say = 0.0
+    last_action = ""
+
+    def autopilot_say(distance, action):
+        nonlocal last_say, last_action
+        now = time.time()
+        if now - last_say < SAY_EVERY_S and action == last_action:
+            return
+        last_say = now
+        last_action = action
+        if distance is None:
+            say(f"Autopilot. {action}.")
+        else:
+            say(f"{action}. Distance {int(distance)} centimeters.")
+
+    autopilot_stop_event.clear()
+    hat_led.on()
+
+    say("Autopilot. Autonomous driving and obstacle avoidance.")
+    print("AUTOPILOT STARTED")
+
     invalid_reads = 0
     escape_side = "LEFT"
 
     try:
         while True:
+            # immediate exit if button pressed
+            if autopilot_stop_event.is_set():
+                say("Exiting autopilot.")
+                break
+
             raw = px.ultrasonic.read()
             distance = sanitize_distance(raw)
+
+            # Cover-to-exit
+            if distance is not None and distance <= COVER_EXIT_DIST:
+                if cover_start is None:
+                    cover_start = time.time()
+                elif time.time() - cover_start >= COVER_EXIT_TIME:
+                    say("Exiting autopilot.")
+                    break
+            else:
+                cover_start = None
 
             if distance is None:
                 invalid_reads += 1
                 px.stop()
-                time.sleep(0.12)
+                autopilot_say(None, "Sensor unclear, stopping")
+
                 if invalid_reads >= MAX_INVALID_READS:
-                    say("Safe mode stopped. Ultrasonic sensor not responding.")
+                    say("Exiting autopilot. Sensor unclear.")
+                    break
+
+                if not sleep_interruptible(0.12):
+                    say("Exiting autopilot.")
                     break
                 continue
 
@@ -387,65 +519,81 @@ def run_safe_mode():
             print("distance:", distance)
 
             if distance >= SafeDistance:
-                blocked_attempts = 0
                 px.set_dir_servo_angle(0)
                 px.forward(POWER)
-                time.sleep(0.02)
+                autopilot_say(distance, "Driving forward")
+                if not sleep_interruptible(0.02):
+                    say("Exiting autopilot.")
+                    break
                 continue
 
             if distance >= DangerDistance:
-                blocked_attempts = 0
                 px.set_dir_servo_angle(30)
                 px.forward(POWER)
-                time.sleep(TURN_TIME)
+                autopilot_say(distance, "Turning")
+                if not sleep_interruptible(TURN_TIME):
+                    say("Exiting autopilot.")
+                    break
                 continue
 
             # Too close: escape routine
-            blocked_attempts += 1
-
             px.set_dir_servo_angle(-30)
             px.backward(POWER)
-            time.sleep(BACK_TIME)
+            autopilot_say(distance, "Backing up")
+            if not sleep_interruptible(BACK_TIME):
+                say("Exiting autopilot.")
+                break
+
             px.stop()
-            time.sleep(0.08)
+            if not sleep_interruptible(0.08):
+                say("Exiting autopilot.")
+                break
 
             if escape_side == "LEFT":
                 px.set_dir_servo_angle(ESCAPE_LEFT_ANGLE)
                 escape_side = "RIGHT"
+                autopilot_say(distance, "Retrying left")
             else:
                 px.set_dir_servo_angle(ESCAPE_RIGHT_ANGLE)
                 escape_side = "LEFT"
+                autopilot_say(distance, "Retrying right")
 
             px.forward(POWER)
-            time.sleep(FORWARD_RECOVER_TIME)
-            px.stop()
-            time.sleep(0.08)
+            if not sleep_interruptible(FORWARD_RECOVER_TIME):
+                say("Exiting autopilot.")
+                break
 
-            if blocked_attempts >= MAX_BLOCKED_ATTEMPTS:
-                px.stop()
-                px.set_dir_servo_angle(0)
-                say("Safe mode stopped. I could not find a safe path.")
+            px.stop()
+            if not sleep_interruptible(0.08):
+                say("Exiting autopilot.")
                 break
 
     finally:
         px.stop()
         px.set_dir_servo_angle(0)
-        print("SAFE MODE ENDED")
+        hat_led.off()
+        autopilot_stop_event.clear()
+        print("AUTOPILOT ENDED")
+
 
 # ----------------------------
 # Help text (Drive mode)
 # ----------------------------
 def help_drive():
     return (
-        "Drive commands: start, stop, forward, backward, left, right, straight, circle. "
-        "Speed commands: faster, slower, speed 40. "
+        "Drive: start, stop, forward, backward, left, right, straight, circle. "
+        "Speed: faster, slower, speed 40. "
         "Modes: pulse mode, continuous mode. "
-        "Fun: dance, spin, look around, nod, shake head, camera center, camera left, camera right, camera up, camera down."
+        "Fun: dance, drift, scan, turbo, look around, nod, shake head. "
+        "Autopilot: say autopilot. Press USR to exit."
     )
+
 
 # ----------------------------
 # Main
 # ----------------------------
+music.music_play('../musics/mac_startup.mp3')
+time.sleep(2)
 say(WELCOME)
 print(WELCOME)
 print('Say "hey wally" to wake. Say "sleep" to pause. Ctrl+C to quit.')
@@ -457,12 +605,14 @@ try:
         print("Wake word detected. Listening... (say 'sleep' to pause)")
 
         while True:
-            # Keep continuous motion going
             if mode == MODE_DRIVE and drive_style == "continuous":
                 refresh_continuous()
 
             if mode == MODE_AI:
-                camera_nod(3)
+                led_listening()
+                signal_listening()
+            else:
+                led_off()
 
             res = stt.listen(stream=False)
             text = res.get("text", "") if isinstance(res, dict) else str(res)
@@ -472,7 +622,6 @@ try:
 
             print("Heard:", text)
 
-            # --- session control ---
             if "sleep" in text:
                 stop_car(center=True)
                 drive_enabled = False
@@ -484,11 +633,11 @@ try:
                 say(help_drive())
                 continue
 
-            # --- mode switches (accept mishears) ---
             if any(k in text for k in AI_MODE_TRIGGERS):
                 mode = MODE_AI
                 drive_enabled = False
                 stop_car(center=True)
+                led_listening()
                 say("AI mode. Ask me a question.")
                 continue
 
@@ -499,18 +648,18 @@ try:
                 say("Drive mode.")
                 continue
 
-            if any(k in text for k in SAFE_MODE_TRIGGERS):
+            if any(k in text for k in AUTOPILOT_TRIGGERS):
                 stop_car(center=True)
                 drive_enabled = False
                 mode = MODE_DRIVE
-                run_safe_mode()
+                run_autopilot()
                 say(WELCOME)
                 print(WELCOME)
                 continue
 
-            # --- stop/start ---
             if "stop" in text or "disable" in text:
                 drive_enabled = False
+                music.music_stop()
                 stop_car(center=True)
                 say("Stopped.")
                 continue
@@ -523,13 +672,22 @@ try:
                     say("Drive enabled.")
                 continue
 
-            # --- AI mode ---
             if mode == MODE_AI:
                 stop_car(center=False)
                 ask_llm_and_speak(text)
                 continue
 
-            # --- Drive mode only below ---
+            if "music" in text:
+                camera_nod(3)
+                say("Playing music.")
+                music.music_stop()
+                music.music_play('../musics/wall_e_adventure.mp3')
+                continue
+
+            if "honk" in text:
+                music.sound_play('../sounds/car-double-horn.wav')
+                continue
+
             if is_question(text):
                 say("Say AI mode if you want me to answer questions.")
                 continue
@@ -538,7 +696,6 @@ try:
                 say("Say start first.")
                 continue
 
-            # speed
             if "faster" in text:
                 speed = clamp(speed + 5, 10, 60)
                 say(f"Speed {speed}.")
@@ -556,7 +713,6 @@ try:
                     say(f"Speed set to {speed}.")
                 continue
 
-            # driving style
             if "pulse mode" in text:
                 drive_style = "pulse"
                 circle_active = False
@@ -570,15 +726,22 @@ try:
                 say("Continuous mode.")
                 continue
 
-            # fun commands
             if "dance" in text:
                 say("Dancing.")
                 fun_dance()
                 continue
 
-            if "spin" in text:
-                say("Spinning.")
-                fun_spin_short()
+            if "drift" in text:
+                say("Drifting.")
+                do_drift()
+                continue
+
+            if "scan" in text:
+                do_scan()
+                continue
+
+            if "turbo" in text:
+                do_turbo_toggle()
                 continue
 
             if "look around" in text or "lookaround" in text:
@@ -586,7 +749,6 @@ try:
                 fun_lookaround()
                 continue
 
-            # camera fun
             if "nod" in text:
                 if camera_supported():
                     say("Nodding.")
@@ -611,39 +773,6 @@ try:
                     say("Camera servos are not connected.")
                 continue
 
-            if "camera left" in text:
-                if camera_supported():
-                    set_cam_tilt(cam_tilt + 15)
-                    say("Camera left.")
-                else:
-                    say("Camera servos are not connected.")
-                continue
-
-            if "camera right" in text:
-                if camera_supported():
-                    set_cam_tilt(cam_tilt - 15)
-                    say("Camera right.")
-                else:
-                    say("Camera servos are not connected.")
-                continue
-
-            if "camera up" in text:
-                if camera_supported():
-                    set_cam_pan(cam_pan + 15)
-                    say("Camera up.")
-                else:
-                    say("Camera servos are not connected.")
-                continue
-
-            if "camera down" in text:
-                if camera_supported():
-                    set_cam_pan(cam_pan - 15)
-                    say("Camera down.")
-                else:
-                    say("Camera servos are not connected.")
-                continue
-
-            # motion
             if "forward" in text:
                 circle_active = False
                 if drive_style == "pulse":
@@ -668,7 +797,7 @@ try:
                     drive_left_pulse()
                 else:
                     px.set_dir_servo_angle(STEER_LEFT)
-                    px.forward(speed)
+                    px.forward(current_drive_speed())
                     continuous_motion = "FWD"
                 say("Left.")
                 continue
@@ -679,7 +808,7 @@ try:
                     drive_right_pulse()
                 else:
                     px.set_dir_servo_angle(STEER_RIGHT)
-                    px.forward(speed)
+                    px.forward(current_drive_speed())
                     continuous_motion = "FWD"
                 say("Right.")
                 continue
@@ -706,3 +835,4 @@ finally:
     except Exception:
         pass
     print("Stopped and centered. Bye.")
+    hat_led.off()
