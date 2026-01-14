@@ -12,13 +12,7 @@ from picarx.llm import Ollama
 from picarx.music import Music
 from gpiozero import Button, LED
 
-# Optional computer vision
-try:
-    from vilib import Vilib
-    VILIB_AVAILABLE = True
-except Exception:
-    VILIB_AVAILABLE = False
-
+print("BOOT: reached python start")
 
 # systemd services often have no login session; picarx uses os.getlogin()
 # which can crash with OSError -25. Force a stable username.
@@ -29,6 +23,45 @@ except Exception:
     os.environ.setdefault("LOGNAME", "picar")
     os.environ.setdefault("USER", "picar")
     os.environ.setdefault("HOME", "/home/picar")
+
+usr_button = Button(25, pull_up=True)   # USR button
+rst_button = Button(16, pull_up=True)   # RST button
+hat_led = LED(26)     
+
+hat_led.on()
+time.sleep(0.2)
+hat_led.off()
+
+# --- OFFLINE VOSK FIX ---
+# SunFounder Vosk wrapper downloads model-list.json from alphacephei.com at startup.
+# Offline -> DNS fails -> program crashes. We force a local model name and skip web.
+try:
+    import sunfounder_voice_assistant.stt.vosk as _vosk_mod
+    from pathlib import Path
+
+    LOCAL_MODEL_NAME = "vosk-model-small-en-us-0.15"
+    LOCAL_MODEL_PATH = Path("/opt/vosk_models") / LOCAL_MODEL_NAME
+
+    def offline_update_model_list(self):
+        # Provide the structures the wrapper expects, without any network call.
+        self.available_languages = ["en-us"]
+        self.available_model_names = [LOCAL_MODEL_NAME]
+        self.available_model_urls = [""]
+
+    def offline_get_model_name(self, lang: str) -> str:
+        # Always return our local model for en-us
+        return LOCAL_MODEL_NAME
+
+    # Apply patches
+    _vosk_mod.Vosk.update_model_list = offline_update_model_list
+    _vosk_mod.Vosk.get_model_name = offline_get_model_name
+
+    # Optional: fail early with a clear message if model folder missing
+    if not LOCAL_MODEL_PATH.exists():
+        print(f"Vosk model missing: {LOCAL_MODEL_PATH}. Install it into /opt/vosk_models/")
+except Exception as _e:
+    print("Offline Vosk patch failed:", _e)
+
 
 # ----------------------------
 # Modes
@@ -44,12 +77,7 @@ stt = Vosk(language="en-us")
 
 tts = Piper()
 tts.set_model("en_US-ryan-low")
-
 music = Music()
-
-usr_button = Button(25, pull_up=True)   # USR button
-rst_button = Button(16, pull_up=True)   # RST button
-hat_led = LED(26)                       # LED
 
 # ---- Autopilot stop event (instant stop even during sleeps) ----
 autopilot_stop_event = threading.Event()
@@ -84,12 +112,7 @@ WELCOME = (
     "Hello. Say hey wally. Say start for drive mode, ai mode for questions, "
     "or autopilot for autonomous driving and obstacle avoidance."
 )
-
-llm = Ollama(ip="localhost", model="llama3.2:3b")
-llm.set_max_messages(20)
-llm.set_instructions(INSTRUCTIONS)
-llm.set_welcome(WELCOME)
-
+llm = None
 WAKE_WORDS = ["hey wally"]
 
 # State
@@ -138,6 +161,22 @@ DRIVE_MODE_TRIGGERS = ("drive mode", "dr more", "dr mode", "drive")
 # ----------------------------
 # Helpers
 # ----------------------------
+def get_llm():
+    global llm
+    if llm is not None:
+        return llm
+    # Create only when needed (prevents boot hangs if networking/DNS is weird)
+    try:
+        _llm = Ollama(ip="127.0.0.1", model="llama3.2:3b")
+        _llm.set_max_messages(20)
+        _llm.set_instructions(INSTRUCTIONS)
+        _llm.set_welcome(WELCOME)
+        llm = _llm
+        return llm
+    except Exception as e:
+        print("LLM init failed:", e)
+        return None
+
 def led_off():
     try:
         hat_led.off()
@@ -236,6 +275,10 @@ def speak_streaming_response(token_stream):
 
 def ask_llm_and_speak(question: str):
     print("LLM question:", question)
+    llm_obj = get_llm()
+    if llm_obj is None:
+        say("AI is offline right now.")
+        return
     try:
         led_thinking()
         camera_nod(3)
@@ -504,11 +547,6 @@ def run_autopilot():
             if distance is None:
                 invalid_reads += 1
                 px.stop()
-                autopilot_say(None, "Sensor unclear, stopping")
-
-                if invalid_reads >= MAX_INVALID_READS:
-                    say("Exiting autopilot. Sensor unclear.")
-                    break
 
                 if not sleep_interruptible(0.12):
                     say("Exiting autopilot.")
@@ -592,9 +630,14 @@ def help_drive():
 # ----------------------------
 # Main
 # ----------------------------
+print("BOOT: about to speak welcome")
+hat_led.on()
 music.music_play('../musics/mac_startup.mp3')
 time.sleep(2)
+music.sound_play('../sounds/car-double-horn.wav')
+time.sleep(0.2)
 say(WELCOME)
+hat_led.off()
 print(WELCOME)
 print('Say "hey wally" to wake. Say "sleep" to pause. Ctrl+C to quit.')
 
